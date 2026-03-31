@@ -4,16 +4,38 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from DrissionPage import ChromiumOptions, ChromiumPage
 import os
+import re
 
+
+# # ================= 1. 浏览器基础配置 =================
+# def setup_browser():
+#     co = ChromiumOptions()
+#     co.headless(False)
+#     co.mute(True)
+#
+#     # 【改动 1】删除无痕模式 co.incognito(True)
+#
+#     # 【改动 2】为爬虫指定一个专属的缓存数据目录！(它会在你的项目里自动生成一个 bot_data 文件夹)
+#     co.set_user_data_path(r'./bot_data')
+#
+#     co.set_argument('--lang=en-US')
+#     co.set_user_agent(
+#         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+#
+#     page = ChromiumPage(co)
+#     return page
 
 # ================= 1. 浏览器基础配置 =================
 def setup_browser():
     co = ChromiumOptions()
-    co.headless(True)  # 开启无头模式
-    co.no_imgs(True)  # 拦截图片加载，极大地提升网页加载速度
-    co.mute(True)  # 静音
+    co.headless(True)
+    co.mute(True)
 
-    # 反检测优化：设置一个常见的 User-Agent
+    # 【提速 1】重新开启拦截图片！提速核心！
+    co.no_imgs(True)
+
+    co.set_user_data_path(r'./bot_data')
+    co.set_argument('--lang=en-US')
     co.set_user_agent(
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
@@ -23,44 +45,59 @@ def setup_browser():
 
 # ================= 2. 单个网页的抓取逻辑 =================
 def fetch_bsr(asin, page):
-    """
-    处理单个 ASIN，提取 BSR
-    """
-    # 拼接亚马逊的短链接
-    url = f"https://www.amazon.com/dp/{asin}"
+    url = f"https://www.amazon.com/dp/{asin}?language=en_US"
     tab = page.new_tab(url)
 
     try:
-        # 等待页面加载（寻找 BSR 关键字）
-        tab.wait.ele_loaded('text:Best Sellers Rank', timeout=10)
+        # 【提速 2】去掉死等 2 秒，改为等待页面基础元素开始加载
+        tab.wait.load_start()
 
-        # 提取 BSR 数据（根据亚马逊页面结构，BSR 通常在包含该文本的父节点中）
-        bsr_element = tab.ele('text:Best Sellers Rank').parent(2).text
-        bsr_data = bsr_element.replace('\n', ' ').strip()
+        # 【提速 3】将验证拦截的寻找时间缩短为 0.5 秒。没有拦截就光速放行
+        bot_btn = tab.ele('text:Continue shopping', timeout=0.1)
+        if bot_btn:
+            bot_btn.click()
+            tab.wait(2)
 
-        print(f"[成功] {asin} | 数据: {bsr_data[:30]}...")
-        return {"ASIN": asin, "BSR": bsr_data, "状态": "成功"}
+        # 加快向下滚动的节奏
+        tab.scroll.to_half()
+        tab.wait(0.5)
+        tab.scroll.to_bottom()
+        tab.wait(0.5)
+
+        page_text = tab.ele('tag:body').text
+        pattern = r'#([0-9,]+)\s+in\s+([^\n\(]+)'
+        matches = re.findall(pattern, page_text)
+
+        if matches:
+            main_rank = f"#{matches[0][0]} in {matches[0][1].strip()}"
+            sub_rank = ""
+            if len(matches) > 1:
+                sub_rank = f" | #{matches[1][0]} in {matches[1][1].strip()}"
+
+            final_bsr = main_rank + sub_rank
+            print(f"[成功] {asin} | 排名: {final_bsr}")
+            return {"ASIN": asin, "BSR": final_bsr, "状态": "成功"}
+
+        else:
+            print(f"[失败] {asin} | 没找到格式。已截图。")
+            tab.get_screenshot(path=f'error_{asin}.jpg')
+            return {"ASIN": asin, "BSR": "未找到排名", "状态": "失败"}
 
     except Exception as e:
-        print(f"[超时/异常] {asin} | 可能无 BSR 或遭遇反爬")
-        return {"ASIN": asin, "BSR": "未抓取到", "状态": "失败"}
+        print(f"[报错] {asin} | 具体报错: {type(e).__name__} - {str(e)}")
+        return {"ASIN": asin, "BSR": "抓取报错", "状态": "失败"}
 
     finally:
-        tab.close()  # 极其重要：释放内存
+        tab.close()
 
 
 # ================= 3. 主程序逻辑 =================
 def main():
-    # 配置文件路径
     input_file = r'data/input_asins.xlsx'
-
-    # 检查文件是否存在
     if not os.path.exists(input_file):
-        print(f"找不到输入文件: {input_file}，请确保路径正确且表格存在。")
+        print(f"找不到输入文件: {input_file}")
         return
 
-    print("正在读取 Excel 文件...")
-    # 假设你的表格里有一列的名字叫 "ASIN"
     df = pd.read_excel(input_file)
     asins_list = df['ASIN'].dropna().astype(str).tolist()
 
@@ -69,36 +106,31 @@ def main():
     results = []
 
     start_time = time.time()
-    print("开始多线程抓取 (并发数: 4)...")
 
-    # 启动线程池
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        # 提交任务
-        futures = {executor.submit(fetch_bsr, asin, browser): asin for asin in asins_list}
+    try:
+        # 【修改点】把核心抓取逻辑放进 try 块里
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(fetch_bsr, asin, browser): asin for asin in asins_list}
+            for future in as_completed(futures):
+                results.append(future.result())
 
-        # 收集结果
-        for future in as_completed(futures):
-            results.append(future.result())
+        # 整理结果并保存
+        print("正在合并数据并导出结果...")
+        results_df = pd.DataFrame(results)
+        final_df = pd.merge(df, results_df, on="ASIN", how="left")
 
-    browser.quit()
+        current_time = datetime.now().strftime("%Y%m%d_%H%M")
+        output_file = f"data/results/bsr_report_{current_time}.xlsx"
+        final_df.to_excel(output_file, index=False)
 
-    # 整理结果并保存
-    print("正在合并数据并导出结果...")
-    results_df = pd.DataFrame(results)
+        end_time = time.time()
+        print(f"\n🎉 全部任务执行完毕！耗时: {end_time - start_time:.2f} 秒")
+        print(f"📊 报告已保存至: {output_file}")
 
-    # 将抓取结果与原始表格按 ASIN 合并（保留你原表里的其他备注信息）
-    final_df = pd.merge(df, results_df, on="ASIN", how="left")
-
-    # 生成带时间戳的文件名
-    current_time = datetime.now().strftime("%Y%m%d_%H%M")
-    output_file = f"data/results/bsr_report_{current_time}.xlsx"
-
-    # 导出到结果文件夹
-    final_df.to_excel(output_file, index=False)
-
-    end_time = time.time()
-    print(f"\n🎉 全部任务执行完毕！耗时: {end_time - start_time:.2f} 秒")
-    print(f"📊 报告已保存至: {output_file}")
+    finally:
+        # 【安全气囊】无论上面代码是顺利执行完，还是你中途按 Ctrl+C 强退，这句一定会执行！
+        print("正在清理并关闭浏览器引擎...")
+        browser.quit()
 
 
 if __name__ == '__main__':
