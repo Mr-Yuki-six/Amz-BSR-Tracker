@@ -1,0 +1,15 @@
+# Python 缓存和虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# 业务数据文件 (防止把竞品表格推送到 Git)
+data/
+*.xlsx
+*.csv
+
+# 日志文件
+*.log
