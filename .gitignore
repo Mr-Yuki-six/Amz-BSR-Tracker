@@ -6,10 +6,16 @@ venv/
 .venv/
 env/
 
-# 业务数据文件 (防止把竞品表格推送到 Git)
+# 业务数据文件
 data/
 *.xlsx
 *.csv
 
 # 日志文件
 *.log
+
+# 环境变量配置
+.env
+
+.idea/
+bot_data/
