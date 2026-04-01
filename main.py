@@ -34,9 +34,9 @@ def load_config():
         except Exception as e:
             print(f"⚠️ 配置文件解析失败: {e}")
 
-    # 默认保底配置
+    # 默认保底配置：target_category 默认为 None，开启自动捕获模式
     return {
-        "target_category": "Bath Rugs",
+        "target_category": None,
         "max_workers": 5,
         "debug_wait_time": 60,
         "scroll_steps": 2
@@ -80,7 +80,8 @@ def setup_browser(headless=True):
 
 # ================= 3. 数据清洗与抓取逻辑 =================
 def fetch_and_clean_bsr(asin, page, headless=True):
-    target_cat = GLOBAL_CONFIG.get("target_category", "Bath Rugs")
+    # 从配置获取目标类目（可能为 None）
+    target_cat = GLOBAL_CONFIG.get("target_category")
     url = f"https://www.amazon.com/dp/{asin}?language=en_US"
     tab = page.new_tab(url)
 
@@ -147,23 +148,40 @@ def fetch_and_clean_bsr(asin, page, headless=True):
         matches = re.findall(r'#([0-9,]+)\s+in\s+([^\n\(]+)', page_text)
 
         if matches:
+            # 提取大类排名
             result["main_rank"] = int(matches[0][0].replace(',', ''))
             result["main_category"] = matches[0][1].strip()
 
             other_sub_ranks_list = []
             if len(matches) > 1:
+                # 遍历所有捕捉到的小类目
                 for match in matches[1:]:
                     cat_name = match[1].strip()
                     rank_val = int(match[0].replace(',', ''))
-                    # 动态匹配配置中的目标类目
-                    if cat_name == target_cat:
+
+                    # 匹配逻辑：
+                    # 如果用户指定了 target_category 且匹配成功
+                    if target_cat and cat_name == target_cat:
                         result["focus_category_rank"] = rank_val
                     else:
                         other_sub_ranks_list.append({"category": cat_name, "rank": rank_val})
 
+                # 【核心改进】：兜底逻辑
+                # 如果 focus_category_rank 依然为空（即：用户没设 target 或者 设了但页面没对上）
+                # 且抓到了其他小类目排名，则自动取第一个小类目作为焦点排名
+                if result["focus_category_rank"] is None and other_sub_ranks_list:
+                    # 弹出第一个作为焦点
+                    auto_cat = other_sub_ranks_list.pop(0)
+                    result["focus_category_rank"] = auto_cat["rank"]
+                    display_cat = auto_cat["category"]
+                else:
+                    display_cat = target_cat if target_cat else "未发现小类"
+
             result["other_sub_ranks"] = json.dumps(other_sub_ranks_list)
             result["status"] = "success"
-            print(f"[成功] {asin} | 大类: {result['main_rank']} | {target_cat}排名: {result['focus_category_rank']}")
+
+            # 动态打印日志
+            print(f"[成功] {asin} | 大类: {result['main_rank']} | {display_cat}排名: {result['focus_category_rank']}")
         else:
             print(f"[失败] {asin} | 未找到排名。")
             if GLOBAL_CONFIG.get("save_error_screenshot", True):
@@ -195,13 +213,15 @@ def save_to_db(result_dict):
                        INSERT INTO products (asin, title, brand, material, back_material, item_shape, item_size)
                        VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (asin) DO
                        UPDATE
-                       SET
-                           title = COALESCE (EXCLUDED.title, products.title), brand = COALESCE (EXCLUDED.brand, products.brand), material = COALESCE (EXCLUDED.material, products.material);
+                           SET
+                               title = COALESCE (EXCLUDED.title, products.title),
+                           brand = COALESCE (EXCLUDED.brand, products.brand),
+                           material = COALESCE (EXCLUDED.material, products.material);
                        """, (result_dict["asin"], result_dict["title"], result_dict["brand"],
                              result_dict["material"], result_dict["back_material"],
                              result_dict["item_shape"], result_dict["size"]))
 
-        # 2. 写入历史表 (使用通用的 focus_category_rank)
+        # 2. 写入历史表
         cursor.execute("""
                        INSERT INTO bsr_history (asin, main_category, main_rank, focus_category_rank, other_sub_ranks,
                                                 rating, reviews)
@@ -235,7 +255,6 @@ def main():
         print("❌ 找不到输入文件 data/input_asins.xlsx")
         return
 
-    # 读取 ASIN 列表
     asins_list = pd.read_excel(input_file)['ASIN'].dropna().astype(str).tolist()
     if args.limit: asins_list = asins_list[:args.limit]
 
@@ -245,8 +264,6 @@ def main():
 
     headless_mode = not args.debug
     browser = setup_browser(headless=headless_mode)
-
-    # 调试模式强制单线程，常规模式根据配置
     workers = GLOBAL_CONFIG.get("max_workers", 5) if headless_mode else 1
 
     print(f"🚀 开始处理 {total_count} 个 ASIN (线程数: {workers})...")
@@ -254,36 +271,26 @@ def main():
 
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            # 提交任务
             futures = {executor.submit(fetch_and_clean_bsr, asin, browser, headless_mode): asin for asin in asins_list}
 
-            # 使用 tqdm 显示进度条，bar_format 确保显示 (当前/总数)
             with tqdm(total=total_count, desc="📊 抓取进度", unit="asin",
                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]') as pbar:
                 for future in as_completed(futures):
                     result = future.result()
-
-                    # 统计成功与失败
                     if result.get("status") == "success":
                         success_count += 1
                         save_to_db(result)
                     else:
                         failed_count += 1
-
                     pbar.update(1)
 
-        # === 任务汇总报告 ===
         end_time = time.time()
         duration = end_time - start_time
-        avg_speed = duration / total_count if total_count > 0 else 0
-
         print("\n" + "=" * 50)
         print("🚩 任务汇总报告")
         print(f"⏱️  总耗时: {duration:.2f} 秒")
-        print(f"📈 平均速率: {avg_speed:.2f} 秒/个")
         print(f"✅ 抓取成功: {success_count}")
         print(f"❌ 抓取失败: {failed_count}")
-        print(f"📊 成功率: {(success_count / total_count) * 100:.1f}%" if total_count > 0 else "N/A")
         print("=" * 50 + "\n")
 
     finally:
