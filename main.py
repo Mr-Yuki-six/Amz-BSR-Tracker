@@ -31,13 +31,12 @@ def get_db_connection():
 
 
 # ================= 2. 浏览器基础配置 =================
-# 修改 setup_browser 接收一个 headless 参数
 def setup_browser(headless=True):
     co = ChromiumOptions()
     co.headless(headless)  # 根据参数决定是否开启无头模式
     co.mute(True)
     if headless:
-        co.no_imgs(True)  # 无头模式下才禁用图片，方便调试时肉眼看图
+        co.no_imgs(True)  # 无头模式下才禁用图片，加快速度
 
     co.set_user_data_path(r'./bot_data')
     co.set_argument('--lang=en-US')
@@ -47,29 +46,29 @@ def setup_browser(headless=True):
 
 
 # ================= 3. 数据清洗与抓取逻辑 =================
-def fetch_and_clean_bsr(asin, page):
+def fetch_and_clean_bsr(asin, page, headless=True):
     url = f"https://www.amazon.com/dp/{asin}?language=en_US"
     tab = page.new_tab(url)
 
-    # 【改动 1】扩充结果字典，装载新字段
     result = {
         "asin": asin,
         "title": None, "brand": None,
-        "material": None, "back_material": None, "item_shape": None, "size": None,  # 新增静态属性
+        "material": None, "back_material": None, "item_shape": None, "size": None,
         "main_category": None, "main_rank": None,
-        "sub_category": None, "sub_rank": None,
-        "rating": None, "reviews": None,  # 新增动态属性
+        "bath_rugs_rank": None, "other_sub_ranks": "[]",
+        "rating": None, "reviews": None,
         "status": "failed"
     }
 
     try:
         tab.wait.load_start()
+        # 自动点击“继续购物”按钮（如果有反爬拦截）
         bot_btn = tab.ele('text:Continue shopping', timeout=0.5)
         if bot_btn:
             bot_btn.click()
             tab.wait(2)
 
-        # 提取标题
+        # 1. 提取标题
         try:
             title_ele = tab.ele('#productTitle', timeout=1)
             if title_ele:
@@ -78,7 +77,7 @@ def fetch_and_clean_bsr(asin, page):
                 meta_content = tab.ele('tag:meta@name=title').attr('content')
                 if meta_content:
                     result["title"] = meta_content.replace("Amazon.com: ", "").split(" : ")[0].strip()
-        except Exception:
+        except:
             pass
 
         tab.scroll.to_half()
@@ -86,8 +85,7 @@ def fetch_and_clean_bsr(asin, page):
         tab.scroll.to_bottom()
         tab.wait(0.5)
 
-        # 【新增：批量提取表格中的静态属性 (Brand, Material, Shape, Size)】
-        # 我们用一个字典循环来抓，代码极其优雅干净
+        # 2. 批量提取表格属性 (XPath 精准定位)
         attributes_to_find = {
             "Brand": "brand",
             "Brand Name": "brand",
@@ -99,68 +97,49 @@ def fetch_and_clean_bsr(asin, page):
 
         for label, key in attributes_to_find.items():
             try:
-                # 【核心修改】使用 XPath 精准狙击！
-                # 意思是：只找 <th> 标签，且无视空格后，文本完全等于 label 的元素
                 xpath_str = f'xpath://th[normalize-space(text())="{label}"]'
                 th_ele = tab.ele(xpath_str, timeout=0.2)
-
                 if th_ele and not result[key]:
-                    # 找到表头后，去同级别的 <td> 里拿数据
                     result[key] = th_ele.parent('tag:tr').ele('tag:td').text.strip()
-            except Exception:
-                continue  # 找不到就安安静静跳过，不影响下一个
+            except:
+                continue
 
-        # 【新增：提取动态评价指标 (Rating, Reviews)】
+        # 3. 提取评价指标
         try:
-            # 寻找带有 data-rating 属性的节点
             rating_ele = tab.ele('@data-rating', timeout=0.5)
             if rating_ele:
-                rating_str = rating_ele.attr('data-rating')  # "4.4 out of 5 stars"
-                result["rating"] = float(rating_str.split()[0])  # 只要 "4.4" 转换为浮点数
+                result["rating"] = float(rating_ele.attr('data-rating').split()[0])
 
             reviews_ele = tab.ele('@data-reviews', timeout=0.5)
             if reviews_ele:
-                result["reviews"] = int(reviews_ele.attr('data-reviews'))  # "42139" 转换为整数
-        except Exception:
+                result["reviews"] = int(reviews_ele.attr('data-reviews'))
+        except:
             pass
 
-        # 提取 BSR
+        # 4. 提取 BSR 排名
         page_text = tab.ele('tag:body').text
         pattern = r'#([0-9,]+)\s+in\s+([^\n\(]+)'
         matches = re.findall(pattern, page_text)
 
         if matches:
-            # 大类目逻辑不变
             result["main_rank"] = int(matches[0][0].replace(',', ''))
             result["main_category"] = matches[0][1].strip()
 
-            # 【核心逻辑升级】
-            bath_rugs_rank = None
             other_sub_ranks_list = []
-
             if len(matches) > 1:
                 for match in matches[1:]:
                     cat_name = match[1].strip()
                     rank_val = int(match[0].replace(',', ''))
-
-                    # 检查是否是核心关注类目
                     if cat_name == "Bath Rugs":
-                        bath_rugs_rank = rank_val
+                        result["bath_rugs_rank"] = rank_val
                     else:
-                        # 其他类目存入 JSON 列表
-                        other_sub_ranks_list.append({
-                            "category": cat_name,
-                            "rank": rank_val
-                        })
+                        other_sub_ranks_list.append({"category": cat_name, "rank": rank_val})
 
-            result["bath_rugs_rank"] = bath_rugs_rank
             result["other_sub_ranks"] = json.dumps(other_sub_ranks_list)
-
             result["status"] = "success"
-            print(f"[成功] {asin} | 大类: {result['main_rank']} | Bath Rugs排名: {bath_rugs_rank}")
+            print(f"[成功] {asin} | 大类: {result['main_rank']} | Bath Rugs排名: {result['bath_rugs_rank']}")
         else:
             print(f"[失败] {asin} | 未找到排名格式。正在截图留存...")
-            # 创建 debug 文件夹（如果不存在）
             if not os.path.exists('debug'): os.makedirs('debug')
             tab.get_screenshot(path=f'debug/error_{asin}_{int(time.time())}.jpg')
 
@@ -168,66 +147,13 @@ def fetch_and_clean_bsr(asin, page):
         print(f"[报错] {asin} | {type(e).__name__}")
 
     finally:
+        # 调试模式下等待，方便人工观察
+        if not headless:
+            print(f"🕒 [调试模式] {asin} 抓取完毕，等待 60 秒关闭页面...")
+            tab.wait(60)
         tab.close()
 
     return result
-
-
-# ================= 4. 数据库写入逻辑 =================
-def save_to_db(result_dict):
-    if result_dict["status"] != "success":
-        return
-
-    conn = get_db_connection()
-    if not conn:
-        return
-
-    cursor = conn.cursor()
-    try:
-        # 1. 扩充 upsert 逻辑，将静态属性统统存入 products 表
-        cursor.execute("""
-                       INSERT INTO products (asin, title, brand, material, back_material, item_shape, item_size)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (asin) 
-            DO
-                       UPDATE SET
-                           title = COALESCE (EXCLUDED.title, products.title),
-                           brand = COALESCE (EXCLUDED.brand, products.brand),
-                           material = COALESCE (EXCLUDED.material, products.material),
-                           back_material = COALESCE (EXCLUDED.back_material, products.back_material),
-                           item_shape = COALESCE (EXCLUDED.item_shape, products.item_shape),
-                           item_size = COALESCE (EXCLUDED.item_size, products.item_size);
-                       """, (
-                           result_dict["asin"],
-                           result_dict["title"],
-                           result_dict["brand"],
-                           result_dict["material"],
-                           result_dict["back_material"],
-                           result_dict["item_shape"],
-                           result_dict["size"]
-                       ))
-
-        # 2. 写入历史表，包含核心列和补充列
-        cursor.execute("""
-                       INSERT INTO bsr_history (asin, main_category, main_rank, bath_rugs_rank, other_sub_ranks, rating,
-                                                reviews)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s);
-                       """, (
-                           result_dict["asin"],
-                           result_dict["main_category"],
-                           result_dict["main_rank"],
-                           result_dict["bath_rugs_rank"],  # 核心关注类目
-                           result_dict["other_sub_ranks"],  # 其他类目JSON
-                           result_dict["rating"],
-                           result_dict["reviews"]
-                       ))
-
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"[{result_dict['asin']}] 入库失败: {e}")
-    finally:
-        cursor.close()
-        conn.close()
 
 
 # ================= 4. 数据库写入逻辑 =================
@@ -241,11 +167,10 @@ def save_to_db(result_dict):
 
     cursor = conn.cursor()
     try:
-        # 1. 扩充 upsert 逻辑，将静态属性统统存入 products 表
+        # 1. 插入/更新产品基础信息
         cursor.execute("""
                        INSERT INTO products (asin, title, brand, material, back_material, item_shape, item_size)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (asin) 
-            DO
+                       VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (asin) DO
                        UPDATE SET
                            title = COALESCE (EXCLUDED.title, products.title),
                            brand = COALESCE (EXCLUDED.brand, products.brand),
@@ -263,7 +188,7 @@ def save_to_db(result_dict):
                            result_dict.get("size")
                        ))
 
-        # 2. 写入历史表 (绝对不能再有 sub_category 了！)
+        # 2. 插入 BSR 历史记录
         cursor.execute("""
                        INSERT INTO bsr_history (asin, main_category, main_rank, bath_rugs_rank, other_sub_ranks, rating,
                                                 reviews)
@@ -272,8 +197,8 @@ def save_to_db(result_dict):
                            result_dict.get("asin"),
                            result_dict.get("main_category"),
                            result_dict.get("main_rank"),
-                           result_dict.get("bath_rugs_rank"),  # 写入核心关注的 Bath Rugs 排名
-                           result_dict.get("other_sub_ranks"),  # 写入其他的长尾类目 JSON
+                           result_dict.get("bath_rugs_rank"),
+                           result_dict.get("other_sub_ranks"),
                            result_dict.get("rating"),
                            result_dict.get("reviews")
                        ))
@@ -286,13 +211,22 @@ def save_to_db(result_dict):
         cursor.close()
         conn.close()
 
+
 # ================= 5. 主程序 =================
 def main():
-    # --- 增加命令行参数解析 ---
     parser = argparse.ArgumentParser(description="Amazon BSR Tracker Debug Options")
-    parser.add_argument('--debug', action='store_true', help='开启调试模式：显示浏览器窗口并加载图片')
-    parser.add_argument('--limit', type=int, default=None, help='限制运行的 ASIN 数量，例如 --limit 5')
+    parser.add_argument('--debug', action='store_true', help='开启调试模式：显示浏览器窗口且不关屏')
+    parser.add_argument('--limit', type=int, default=None, help='限制运行的 ASIN 数量')
     args = parser.parse_args()
+
+    # 数据库预检
+    print("🔍 正在预检数据库连接...")
+    check_conn = get_db_connection()
+    if not check_conn:
+        print("🛑 数据库连接失败，请检查 .env 配置。")
+        return
+    check_conn.close()
+    print("✅ 数据库连接正常。")
 
     input_file = r'data/input_asins.xlsx'
     if not os.path.exists(input_file):
@@ -302,29 +236,28 @@ def main():
     df = pd.read_excel(input_file)
     asins_list = df['ASIN'].dropna().astype(str).tolist()
 
-    # --- 根据参数截取 ASIN 列表 ---
     if args.limit:
         print(f"⚠️ [调试] 仅测试前 {args.limit} 个 ASIN")
         asins_list = asins_list[:args.limit]
 
-    # --- 根据参数决定是否开启无头模式 ---
     headless_mode = not args.debug
     if args.debug:
-        print("🔍 [调试] 正在以“有头模式”启动浏览器...")
+        print("🔍 [调试] 以“有头模式”启动，每条数据将停留 60 秒。")
 
     print(f"准备处理 {len(asins_list)} 个 ASIN...")
     browser = setup_browser(headless=headless_mode)
     start_time = time.time()
 
     try:
-        # 维持原有的 ThreadPoolExecutor 逻辑
-        with ThreadPoolExecutor(max_workers=10 if headless_mode else 1) as executor:
-            # 调试模式建议把并发降到 1，方便你盯着一个窗口看
-            futures = {executor.submit(fetch_and_clean_bsr, asin, browser): asin for asin in asins_list}
+        # 调试模式建议单线程运行，方便观察
+        workers = 10 if headless_mode else 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # 这里的参数 headless_mode 成功传入抓取函数
+            futures = {executor.submit(fetch_and_clean_bsr, asin, browser, headless_mode): asin for asin in asins_list}
             for future in as_completed(futures):
                 save_to_db(future.result())
 
-        print(f"\n🎉 任务执行完毕！耗时: {time.time() - start_time:.2f} 秒")
+        print(f"\n🎉 任务执行完毕！总耗时: {time.time() - start_time:.2f} 秒")
 
     finally:
         browser.quit()

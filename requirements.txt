@@ -1,3 +1,10 @@
-DrissionPage>=4.0.0
-pandas>=2.0.0
-openpyxl>=3.1.0
+# --- 自动化与浏览器控制 ---
+DrissionPage
+
+# --- 数据处理 ---
+pandas
+openpyxl
+
+# --- 数据库与环境管理 ---
+psycopg2-binary
+python-dotenv
