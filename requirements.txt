@@ -8,3 +8,6 @@ openpyxl
 # --- 数据库与环境管理 ---
 psycopg2-binary
 python-dotenv
+
+# --- 进度监测 ---
+tqdm
