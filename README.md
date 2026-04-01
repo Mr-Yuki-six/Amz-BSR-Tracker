@@ -22,7 +22,7 @@
 
 ```bash
 # 克隆项目
-git clone [https://github.com/YourUsername/Amz-BSR-Tracker.git](https://github.com/YourUsername/Amz-BSR-Tracker.git)
+git clone https://github.com/Mr-Yuki-six/Amz-BSR-Tracker
 cd Amz-BSR-Tracker
 
 # 安装依赖
