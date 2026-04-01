@@ -1,4 +1,3 @@
-```markdown
 # 🛒 Amz-BSR-Tracker: 亚马逊竞品排名自动化追踪系统
 
 这是一个专为亚马逊精细化运营设计的自动化竞争情报爬虫系统。利用原生的浏览器指纹伪装技术，突破高强度反爬限制，精准抓取竞品的 BSR (Best Sellers Rank)、评分、评论数以及多级类目排名，并自动沉淀至 PostgreSQL 数据库，为后续的 BI 可视化面板（如 Grafana / Metabase）提供结构化的时间序列数据。
