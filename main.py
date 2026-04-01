@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from DrissionPage import ChromiumOptions, ChromiumPage
 import json
+import argparse
 
 # 加载 .env 文件中的敏感配置
 load_dotenv()
@@ -30,11 +31,14 @@ def get_db_connection():
 
 
 # ================= 2. 浏览器基础配置 =================
-def setup_browser():
+# 修改 setup_browser 接收一个 headless 参数
+def setup_browser(headless=True):
     co = ChromiumOptions()
-    co.headless(True)
+    co.headless(headless)  # 根据参数决定是否开启无头模式
     co.mute(True)
-    co.no_imgs(True)
+    if headless:
+        co.no_imgs(True)  # 无头模式下才禁用图片，方便调试时肉眼看图
+
     co.set_user_data_path(r'./bot_data')
     co.set_argument('--lang=en-US')
     co.set_user_agent(
@@ -155,7 +159,10 @@ def fetch_and_clean_bsr(asin, page):
             result["status"] = "success"
             print(f"[成功] {asin} | 大类: {result['main_rank']} | Bath Rugs排名: {bath_rugs_rank}")
         else:
-            print(f"[失败] {asin} | 未找到排名格式")
+            print(f"[失败] {asin} | 未找到排名格式。正在截图留存...")
+            # 创建 debug 文件夹（如果不存在）
+            if not os.path.exists('debug'): os.makedirs('debug')
+            tab.get_screenshot(path=f'debug/error_{asin}_{int(time.time())}.jpg')
 
     except Exception as e:
         print(f"[报错] {asin} | {type(e).__name__}")
@@ -281,6 +288,12 @@ def save_to_db(result_dict):
 
 # ================= 5. 主程序 =================
 def main():
+    # --- 增加命令行参数解析 ---
+    parser = argparse.ArgumentParser(description="Amazon BSR Tracker Debug Options")
+    parser.add_argument('--debug', action='store_true', help='开启调试模式：显示浏览器窗口并加载图片')
+    parser.add_argument('--limit', type=int, default=None, help='限制运行的 ASIN 数量，例如 --limit 5')
+    args = parser.parse_args()
+
     input_file = r'data/input_asins.xlsx'
     if not os.path.exists(input_file):
         print("找不到输入文件！")
@@ -289,21 +302,29 @@ def main():
     df = pd.read_excel(input_file)
     asins_list = df['ASIN'].dropna().astype(str).tolist()
 
-    print(f"准备抓取并入库 {len(asins_list)} 个 ASIN...")
-    browser = setup_browser()
+    # --- 根据参数截取 ASIN 列表 ---
+    if args.limit:
+        print(f"⚠️ [调试] 仅测试前 {args.limit} 个 ASIN")
+        asins_list = asins_list[:args.limit]
+
+    # --- 根据参数决定是否开启无头模式 ---
+    headless_mode = not args.debug
+    if args.debug:
+        print("🔍 [调试] 正在以“有头模式”启动浏览器...")
+
+    print(f"准备处理 {len(asins_list)} 个 ASIN...")
+    browser = setup_browser(headless=headless_mode)
     start_time = time.time()
 
     try:
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # 维持原有的 ThreadPoolExecutor 逻辑
+        with ThreadPoolExecutor(max_workers=10 if headless_mode else 1) as executor:
+            # 调试模式建议把并发降到 1，方便你盯着一个窗口看
             futures = {executor.submit(fetch_and_clean_bsr, asin, browser): asin for asin in asins_list}
-
             for future in as_completed(futures):
-                result = future.result()
-                # 抓取完一条，立刻存入数据库
-                save_to_db(result)
+                save_to_db(future.result())
 
-        end_time = time.time()
-        print(f"\n🎉 抓取及入库全部完成！耗时: {end_time - start_time:.2f} 秒")
+        print(f"\n🎉 任务执行完毕！耗时: {time.time() - start_time:.2f} 秒")
 
     finally:
         browser.quit()
