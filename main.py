@@ -14,12 +14,8 @@ from tqdm import tqdm
 load_dotenv()
 
 
-# ================= 0. 配置文件加载（含自动脱敏逻辑） =================
+# ================= 0. 配置文件加载 =================
 def load_config():
-    """
-    加载配置文件并自动过滤 // 注释。
-    优先读取 config.json，若不存在则读取 config.example.json。
-    """
     config_path = 'config.json'
     if not os.path.exists(config_path):
         config_path = 'config.example.json'
@@ -28,18 +24,16 @@ def load_config():
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-                # 使用正则表达式去除 // 及其后面的所有内容
                 clean_content = re.sub(r'//.*', '', content)
                 return json.loads(clean_content)
         except Exception as e:
             print(f"⚠️ 配置文件解析失败: {e}")
 
-    # 默认保底配置：target_category 默认为 None，开启自动捕获模式
     return {
         "target_category": None,
         "max_workers": 5,
         "debug_wait_time": 60,
-        "scroll_steps": 2
+        "scroll_steps": 3
     }
 
 
@@ -67,7 +61,6 @@ def setup_browser(headless=True):
     co = ChromiumOptions()
     co.headless(headless)
     co.mute(True)
-    # 根据配置决定无头模式下是否禁用图片
     if headless and GLOBAL_CONFIG.get("headless_img_disabled", True):
         co.no_imgs(True)
 
@@ -80,18 +73,17 @@ def setup_browser(headless=True):
 
 # ================= 3. 数据清洗与抓取逻辑 =================
 def fetch_and_clean_bsr(asin, page, headless=True):
-    # 从配置获取目标类目（可能为 None）
     target_cat = GLOBAL_CONFIG.get("target_category")
     url = f"https://www.amazon.com/dp/{asin}?language=en_US"
     tab = page.new_tab(url)
 
     result = {
-        "asin": asin,
-        "title": None, "brand": None,
+        "asin": asin, "title": None, "brand": None,
         "material": None, "back_material": None, "item_shape": None, "size": None,
         "main_category": None, "main_rank": None,
         "focus_category_rank": None, "other_sub_ranks": "[]",
         "rating": None, "reviews": None,
+        "star_5_pct": None, "star_4_pct": None, "star_3_pct": None, "star_2_pct": None, "star_1_pct": None,
         "status": "failed"
     }
 
@@ -104,25 +96,20 @@ def fetch_and_clean_bsr(asin, page, headless=True):
 
         # 1. 提取标题
         title_ele = tab.ele('#productTitle', timeout=1)
-        if title_ele:
-            result["title"] = title_ele.text.strip()
+        if title_ele: result["title"] = title_ele.text.strip()
 
         # 2. 模拟滚动触发加载
-        steps = GLOBAL_CONFIG.get("scroll_steps", 2)
+        steps = GLOBAL_CONFIG.get("scroll_steps", 3)
         for _ in range(steps):
-            tab.scroll.down(600)
+            tab.scroll.down(800)
             tab.wait(0.5)
 
-        # 3. 批量提取表格属性 (XPath 精准定位)
+        # 3. 提取属性表格 (Brand, Material 等)
         attr_map = {
-            "Brand": "brand",
-            "Brand Name": "brand",
-            "Material Type": "material",
-            "Back Material Type": "back_material",
-            "Item Shape": "item_shape",
-            "Size": "size"
+            "Brand": "brand", "Brand Name": "brand",
+            "Material Type": "material", "Back Material Type": "back_material",
+            "Item Shape": "item_shape", "Size": "size"
         }
-
         for label, key in attr_map.items():
             try:
                 xpath_str = f'xpath://th[normalize-space(text())="{label}"]'
@@ -132,45 +119,76 @@ def fetch_and_clean_bsr(asin, page, headless=True):
             except:
                 continue
 
-        # 4. 提取评价指标
+        # 4. 提取评价指标与星级分布（全新鲁棒逻辑）
         try:
-            rating_ele = tab.ele('@data-rating', timeout=0.5)
+            # 提取综合评分 (例如: "4.6 out of 5 stars")
+            rating_ele = tab.ele('xpath://span[contains(@title, "out of 5 stars")]', timeout=0.5) or tab.ele(
+                'xpath://span[@data-hook="rating-out-of-text"]', timeout=0.5)
             if rating_ele:
-                result["rating"] = float(rating_ele.attr('data-rating').split()[0])
-            reviews_ele = tab.ele('@data-reviews', timeout=0.5)
+                match = re.search(r'([\d.]+)', rating_ele.text or rating_ele.attr('title'))
+                if match: result["rating"] = float(match.group(1))
+
+            # 提取评价总数 (例如: "1,234 ratings")
+            reviews_ele = tab.ele('#acrCustomerReviewText', timeout=0.5) or tab.ele(
+                'xpath://span[@data-hook="total-review-count"]', timeout=0.5)
             if reviews_ele:
-                result["reviews"] = int(reviews_ele.attr('data-reviews'))
-        except:
-            pass
+                match = re.search(r'([\d,]+)', reviews_ele.text)
+                if match: result["reviews"] = int(match.group(1).replace(',', ''))
+
+            # 智能滚动到评论区，触发柱状图加载
+            review_sec = tab.ele('#customerReviews', timeout=1)
+            if review_sec:
+                review_sec.scroll.to_see()
+                tab.wait(0.5)
+
+            # 提取各星级占比百分比
+            hist_table = tab.ele('#histogramTable', timeout=1)
+            if hist_table:
+                # 现在的结构是 <li> 而不是 <tr> 了
+                rows = hist_table.eles('tag:li')
+                for row in rows:
+                    a_tag = row.ele('tag:a')
+                    if a_tag:
+                        # 方案A：直接从无障碍标签提取 (最精准，如 "60 percent of reviews have 5 stars")
+                        aria_label = a_tag.attr('aria-label')
+                        if aria_label:
+                            m = re.search(r'(\d+)\s*percent.*?(\d)\s*star', aria_label, re.IGNORECASE)
+                            if m:
+                                pct, star = m.groups()
+                                result[f"star_{star}_pct"] = int(pct)
+                                continue  # 成功就跳过当前循环
+
+                        # 方案B：兜底方案 (从进度条属性 aria-valuenow 提取)
+                        meter = row.ele('@aria-valuenow', timeout=0.1)
+                        href = a_tag.attr('href')
+                        if meter and href:
+                            star_m = re.search(r'hist_(\d)', href)
+                            if star_m:
+                                star = star_m.group(1)
+                                pct = meter.attr('aria-valuenow')
+                                result[f"star_{star}_pct"] = int(pct)
+        except Exception as e:
+            print(f"[评价解析异常] {asin} - {e}")
 
         # 5. 提取 BSR 排名
         page_text = tab.ele('tag:body').text
         matches = re.findall(r'#([0-9,]+)\s+in\s+([^\n\(]+)', page_text)
 
         if matches:
-            # 提取大类排名
             result["main_rank"] = int(matches[0][0].replace(',', ''))
             result["main_category"] = matches[0][1].strip()
 
             other_sub_ranks_list = []
             if len(matches) > 1:
-                # 遍历所有捕捉到的小类目
                 for match in matches[1:]:
                     cat_name = match[1].strip()
                     rank_val = int(match[0].replace(',', ''))
-
-                    # 匹配逻辑：
-                    # 如果用户指定了 target_category 且匹配成功
                     if target_cat and cat_name == target_cat:
                         result["focus_category_rank"] = rank_val
                     else:
                         other_sub_ranks_list.append({"category": cat_name, "rank": rank_val})
 
-                # 【核心改进】：兜底逻辑
-                # 如果 focus_category_rank 依然为空（即：用户没设 target 或者 设了但页面没对上）
-                # 且抓到了其他小类目排名，则自动取第一个小类目作为焦点排名
                 if result["focus_category_rank"] is None and other_sub_ranks_list:
-                    # 弹出第一个作为焦点
                     auto_cat = other_sub_ranks_list.pop(0)
                     result["focus_category_rank"] = auto_cat["rank"]
                     display_cat = auto_cat["category"]
@@ -180,8 +198,9 @@ def fetch_and_clean_bsr(asin, page, headless=True):
             result["other_sub_ranks"] = json.dumps(other_sub_ranks_list)
             result["status"] = "success"
 
-            # 动态打印日志
-            print(f"[成功] {asin} | 大类: {result['main_rank']} | {display_cat}排名: {result['focus_category_rank']}")
+            # 显示更丰富的日志
+            log_msg = f"[成功] {asin} | {display_cat}: {result['focus_category_rank']} | 评分: {result['rating']} ({result['reviews']})"
+            print(log_msg)
         else:
             print(f"[失败] {asin} | 未找到排名。")
             if GLOBAL_CONFIG.get("save_error_screenshot", True):
@@ -194,7 +213,6 @@ def fetch_and_clean_bsr(asin, page, headless=True):
     finally:
         if not headless:
             wait_time = GLOBAL_CONFIG.get("debug_wait_time", 60)
-            print(f"🕒 [调试] {asin} 完毕，停留 {wait_time}s...")
             tab.wait(wait_time)
         tab.close()
 
@@ -208,27 +226,28 @@ def save_to_db(result_dict):
     if not conn: return
     cursor = conn.cursor()
     try:
-        # 1. 产品基础信息 (UPSERT)
+        # 1. 产品基础信息 (完美修复更新遗漏，并更新 updated_at)
         cursor.execute("""
                        INSERT INTO products (asin, title, brand, material, back_material, item_shape, item_size)
                        VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (asin) DO
                        UPDATE
-                           SET
-                               title = COALESCE (EXCLUDED.title, products.title),
-                           brand = COALESCE (EXCLUDED.brand, products.brand),
-                           material = COALESCE (EXCLUDED.material, products.material);
+                       SET
+                           title = COALESCE (EXCLUDED.title, products.title), brand = COALESCE (EXCLUDED.brand, products.brand), material = COALESCE (EXCLUDED.material, products.material), back_material = COALESCE (EXCLUDED.back_material, products.back_material), item_shape = COALESCE (EXCLUDED.item_shape, products.item_shape), item_size = COALESCE (EXCLUDED.item_size, products.item_size), updated_at = CURRENT_TIMESTAMP;
                        """, (result_dict["asin"], result_dict["title"], result_dict["brand"],
                              result_dict["material"], result_dict["back_material"],
                              result_dict["item_shape"], result_dict["size"]))
 
-        # 2. 写入历史表
+        # 2. 写入历史表 (包含全部星级分布占比)
         cursor.execute("""
                        INSERT INTO bsr_history (asin, main_category, main_rank, focus_category_rank, other_sub_ranks,
-                                                rating, reviews)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s);
+                                                rating, reviews, star_5_pct, star_4_pct, star_3_pct, star_2_pct,
+                                                star_1_pct)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                        """, (result_dict["asin"], result_dict["main_category"], result_dict["main_rank"],
                              result_dict["focus_category_rank"], result_dict["other_sub_ranks"],
-                             result_dict["rating"], result_dict["reviews"]))
+                             result_dict["rating"], result_dict["reviews"],
+                             result_dict["star_5_pct"], result_dict["star_4_pct"], result_dict["star_3_pct"],
+                             result_dict["star_2_pct"], result_dict["star_1_pct"]))
         conn.commit()
     except Exception as e:
         conn.rollback()
