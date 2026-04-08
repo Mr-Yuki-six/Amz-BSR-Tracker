@@ -1,27 +1,15 @@
-# Python 缓存和虚拟环境
-__pycache__/
-*.py[cod]
-*$py.class
-venv/
+# 虚拟环境与缓存
 .venv/
-env/
-
-# 业务数据文件
-data/
-*.xlsx
-*.csv
-
-# 日志文件
-*.log
-
-# 环境变量配置
-.env
-
-.idea/
 bot_data/
+debug/
 
-# 排除私人配置文件
+# 配置文件与本地数据
 config.json
+*.xlsx
+!ASIN_Input_Template.xlsx
 
-# 但保留模板文件
-!config.example.json
+# PyInstaller 打包生成物
+build/
+dist/
+*.spec
+*.exe
